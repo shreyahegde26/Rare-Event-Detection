@@ -7,13 +7,14 @@ from torch.utils.data import DataLoader, Dataset
 import pandas as pd
 
 
-# Define the ANN model
+# Define the ANN model with dynamic input size
 class ANN(nn.Module):
-    def __init__(self):
+    def __init__(self, input_size):
         super(ANN, self).__init__()
-        self.fc1 = nn.Linear(17, 64)  # Input size matches dataset features, one hidden layer
-        self.fc2_class = nn.Linear(64, 10)  # Output for 'class' target (binary classification)
-        self.fc2_state = nn.Linear(64, 1)  # Output for 'state' target (assuming 3 states)
+        self.input_size = input_size  # Store input size dynamically
+        self.fc1 = nn.Linear(input_size, 64)  # Input layer adapts to dataset
+        self.fc2_class = nn.Linear(64, 10)  # Output for 'class' target
+        self.fc2_state = nn.Linear(64, 8)  # Output for 'state' target (assuming 3 states)
 
     def forward(self, x):
         x = torch.relu(self.fc1(x))
@@ -24,54 +25,37 @@ class ANN(nn.Module):
 
 # Define Flower client
 class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, model, train_loader, test_loader,cid):
+    def __init__(self, model, train_loader, test_loader, cid):
         self.model = model
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.cid = cid
-        self.criterion_class = nn.CrossEntropyLoss()  # For 'class' target
-        self.criterion_state = nn.CrossEntropyLoss()  # For 'state' target
+        self.criterion_class = nn.CrossEntropyLoss()
+        self.criterion_state = nn.CrossEntropyLoss()
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
 
     def get_parameters(self, config=None):
-        # Return model parameters as NumPy arrays
-        return [val.detach().cpu().numpy() for val in self.model.parameters()]
+        # Skip input layer and return parameters
+        params = [val.detach().cpu().numpy() for i, val in enumerate(self.model.parameters()) if i > 0]
+        return params
 
     def set_parameters(self, parameters):
-        # Load parameters into the model
-        for param, val in zip(self.model.parameters(), parameters):
-            param.data = torch.tensor(val)
+        # Load parameters, but keep input layer unchanged
+        with torch.no_grad():
+            for i, param in enumerate(self.model.parameters()):
+                if i > 0:  # Do not overwrite the input layer
+                    param.copy_(torch.tensor(parameters[i - 1]))
 
     def fit(self, parameters, config):
-        # Update model parameters
         self.set_parameters(parameters)
-        # Train the model for one epoch
         self.train(epochs=1)
         return self.get_parameters(), len(self.train_loader.dataset), {}
 
     def evaluate(self, parameters, config):
-        # Update model parameters
         self.set_parameters(parameters)
-        # Evaluate the model
         loss, accuracy = self.test()
         return float(loss), len(self.test_loader.dataset), {"accuracy": float(accuracy)}
 
-    # def train(self, epochs):
-    #     self.model.train()
-    #     for _ in range(epochs):
-    #         for batch in self.train_loader:
-    #             features, class_labels, state_labels = (
-    #                 batch["features"],
-    #                 batch["class"],
-    #                 batch["state"],
-    #             )
-    #             self.optimizer.zero_grad()
-    #             class_out, state_out = self.model(features)
-    #             loss_class = self.criterion_class(class_out, class_labels)
-    #             loss_state = self.criterion_state(state_out, state_labels)
-    #             loss = loss_class + loss_state
-    #             loss.backward()
-    #             self.optimizer.step()
     def train(self, epochs):
         self.model.train()
         for _ in range(epochs):
@@ -82,31 +66,15 @@ class FlowerClient(fl.client.NumPyClient):
                     batch["state"],
                 )
 
-                # Debug: Print unique label values in the batch
-
-                if max(class_labels.unique() > 2): 
-                    print(f"Batch Class Labels: {class_labels.unique()}")
-                    print(f"Batch State Labels: {state_labels.unique()}")
-
                 self.optimizer.zero_grad()
                 class_out, state_out = self.model(features)
 
-                # Debug: Print shape of model outputs
-                # print(f"class_out shape: {class_out.shape}")
-                # print(f"state_out shape: {state_out.shape}")
-
-            # Compute loss
-            try:
                 loss_class = self.criterion_class(class_out, class_labels)
                 loss_state = self.criterion_state(state_out, state_labels)
                 loss = loss_class + loss_state
+
                 loss.backward()
                 self.optimizer.step()
-            except IndexError as e:
-                print(f"🔥 Error occurred! {e}")
-                print(f"🔥 Problematic class labels: {class_labels}")
-                print(f"🔥 Problematic state labels: {state_labels}")
-                exit(1)  # Stop execution for debugging
 
     def test(self):
         self.model.eval()
@@ -140,16 +108,11 @@ class FlowerClient(fl.client.NumPyClient):
         return loss / total, overall_accuracy
 
 
-# Custom Dataset
+# Custom Dataset Loader
 class CustomCSVLoader(Dataset):
     def __init__(self, csv_file):
-
         self.data = pd.read_csv(csv_file)
-        # Map labels if needed
-        # self.data['class'] = self.data['class'].map({0.0: 0, 2.0: 2})
-
-        print("Unique class labels:", self.data["class"].unique())
-        print("Unique state labels:", self.data["state"].unique())
+        self.num_features = self.data.shape[1] - 2  # Assuming first two columns are labels
 
     def __len__(self):
         return len(self.data)
@@ -165,15 +128,15 @@ class CustomCSVLoader(Dataset):
         }
 
 
-def load_data():
-    csv_path = "/Users/shreyahegde/Desktop/COLLEGE/SEM 6/TDL/MINI PROJECT /combined files _cleaned/1_combined_cleaned.csv"
+def load_data(csv_path):
     dataset = CustomCSVLoader(csv_file=csv_path)
+    num_features = dataset.num_features  # Store feature count BEFORE making it a Subset
 
-    # Limit the dataset to the first 10,000 instances for verification
     # subset_size = min(100000, len(dataset))  # Ensure it doesn't exceed the dataset size
-    # dataset = torch.utils.data.Subset(dataset, list(range(subset_size)))
+    # subset_indices = list(range(subset_size))
+    # dataset_subset = torch.utils.data.Subset(dataset, subset_indices)
 
-    # Split dataset into train and test
+
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
@@ -181,23 +144,23 @@ def load_data():
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    return train_loader, test_loader
+    return train_loader, test_loader, num_features
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Flower Client")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (unique for each client)")
+    parser.add_argument("--data_path", type=str, required=True, help="Path to client CSV data file")
     args = parser.parse_args()
 
-    # Load data
-    train_loader, test_loader = load_data()
+    # Load dataset and get feature count
+    train_loader, test_loader, input_size = load_data(args.data_path)
 
-    # Create model
-    model = ANN()
+    # Create model dynamically based on feature size
+    model = ANN(input_size=input_size)
 
-    # Start Flower client with the given client ID
+    # Start Flower client
     fl.client.start_numpy_client(
         server_address="localhost:8080",
-        client=FlowerClient(model, train_loader, test_loader,cid = args.cid),
+        client=FlowerClient(model, train_loader, test_loader, cid=args.cid),
     )
