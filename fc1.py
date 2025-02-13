@@ -154,15 +154,21 @@ class CustomCSVLoader(Dataset):
 
 def load_data(csv_path):
     dataset = CustomCSVLoader(csv_file=csv_path)
+
     num_columns = dataset.data.shape[1]
     num_features = dataset.num_features
     # Compute the number of classes and states based on the last two columns.
     num_class = int(dataset.data.iloc[:, num_columns-2].max()) + 1
     num_state = int(dataset.data.iloc[:, num_columns-1].max()) + 1
 
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
+
+    subset_size = min(10000, len(dataset))  # Ensure it doesn't exceed the dataset size
+    subset_indices = list(range(subset_size))
+    dataset_subset = torch.utils.data.Subset(dataset, subset_indices)
+
+    train_size = int(0.8 * len(dataset_subset))
+    test_size = len(dataset_subset) - train_size
+    train_dataset, test_dataset = torch.utils.data.random_split(dataset_subset, [train_size, test_size])
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
