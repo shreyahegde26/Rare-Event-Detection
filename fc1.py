@@ -14,28 +14,32 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.preprocessing import StandardScaler
+
+import torch.nn as nn
+import torch.nn.functional as F
 
 class DNN(nn.Module):
     def __init__(self, input_size, num_class, num_state):
         super(DNN, self).__init__()
         self.input_size = input_size
 
-        self.fc1 = nn.Linear(input_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
+        self.fc1 = nn.Linear(input_size, 512)
+        self.bn1 = nn.LayerNorm(512)
         
-        self.fc2 = nn.Linear(256, 512)
-        self.bn2 = nn.BatchNorm1d(512)
+        self.fc2 = nn.Linear(512, 1024)
+        self.bn2 = nn.LayerNorm(1024)
         
-        self.fc3 = nn.Linear(512, 256)
-        self.bn3 = nn.BatchNorm1d(256)
+        self.fc3 = nn.Linear(1024, 512)
+        self.bn3 = nn.LayerNorm(512)
         
-        self.fc4 = nn.Linear(256, 128)
-        self.bn4 = nn.BatchNorm1d(128)
+        self.fc4 = nn.Linear(512, 256)
+        self.bn4 = nn.LayerNorm(256)
 
-        self.dropout = nn.Dropout(p=0.3)  # Initialize dropout
+        self.dropout = nn.Dropout(p=0.3)  # Initialized
 
-        self.fc2_class = nn.Linear(128, num_class)
-        self.fc2_state = nn.Linear(128, num_state)
+        self.fc2_class = nn.Linear(256, num_class)
+        self.fc2_state = nn.Linear(256, num_state)
 
     def forward(self, x):
         x = F.leaky_relu(self.bn1(self.fc1(x)))
@@ -43,12 +47,14 @@ class DNN(nn.Module):
         x = F.leaky_relu(self.bn2(self.fc2(x)))
         x = self.dropout(x)
         x = F.leaky_relu(self.bn3(self.fc3(x)))
+        x = self.dropout(x)
         x = F.leaky_relu(self.bn4(self.fc4(x)))
 
-        class_out = F.log_softmax(self.fc2_class(x), dim=1)
-        state_out = F.log_softmax(self.fc2_state(x), dim=1)
+        class_out = self.fc2_class(x)  # No softmax here if using CrossEntropyLoss
+        state_out = self.fc2_state(x)
 
         return class_out, state_out
+
 
 # =============================================================================
 # Define the Flower client
@@ -142,50 +148,85 @@ class FlowerClient(fl.client.NumPyClient):
 # =============================================================================
 # Custom Dataset Loader
 # =============================================================================
+import numpy as np
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+import torch
+from torch.utils.data import Dataset
+
 class CustomCSVLoader(Dataset):
-    def __init__(self, csv_file):
+    def __init__(self, csv_file, scaler=None, fit_scaler=False):
         self.data = pd.read_csv(csv_file)
-        # The new dataset: features are all columns except the last two.
         self.num_features = self.data.shape[1] - 2
 
+        # Extract features before labels
+        features = self.data.iloc[:, :self.num_features].values
+
+        # Debugging: Print max, min values
+        print("Max value in dataset:", np.max(features))
+        print("Min value in dataset:", np.min(features))
+
+        # **Step 1: Handle inf/nan values**
+        if np.isinf(features).any() or np.isnan(features).any():
+            print("Warning: Dataset contains inf/nan values. Replacing with mean.")
+            features = np.where(np.isfinite(features), features, np.nan)
+            col_means = np.nanmean(features, axis=0)
+            indices = np.where(np.isnan(features))
+            features[indices] = np.take(col_means, indices[1])
+
+        # **Step 2: Clip extreme values to a reasonable range**
+        features = np.clip(features, -1e6, 1e6)  # Adjust threshold if needed
+
+        # **Step 3: Convert safely to float32**
+        features = features.astype("float32")
+
+        # **Step 4: Scale features**
+        if fit_scaler:
+            self.scaler = StandardScaler()
+            self.scaler.fit(features)  # Fit only on training data
+        else:
+            self.scaler = scaler  # Use precomputed scaler
+
+        self.features = self.scaler.transform(features)
+
+        self.class_labels = self.data.iloc[:, self.num_features].values.astype(int)
+        self.state_labels = self.data.iloc[:, self.num_features + 1].values.astype(int)
+
     def __len__(self):
-        return len(self.data)
+        return len(self.features)
 
     def __getitem__(self, idx):
-        num_columns = self.data.shape[1]
-        # Features are all columns except the last two.
-        features = self.data.iloc[idx, :num_columns-2].values.astype("float32")
-        # The second-to-last column is the class label.
-        class_label = int(self.data.iloc[idx, num_columns-2])
-        # The last column is the state label.
-        state_label = int(self.data.iloc[idx, num_columns-1])
         return {
-            "features": torch.tensor(features),
-            "class": torch.tensor(class_label, dtype=torch.long),
-            "state": torch.tensor(state_label, dtype=torch.long),
+            "features": torch.tensor(self.features[idx], dtype=torch.float32),
+            "class": torch.tensor(self.class_labels[idx], dtype=torch.long),
+            "state": torch.tensor(self.state_labels[idx], dtype=torch.long),
         }
 
+    
+
 def load_data(csv_path):
-    dataset = CustomCSVLoader(csv_file=csv_path)
+    full_dataset = CustomCSVLoader(csv_path, fit_scaler=True)
+    scaler = full_dataset.scaler  # Save scaler for test dataset
 
-    num_columns = dataset.data.shape[1]
-    num_features = dataset.num_features
-    # Compute the number of classes and states based on the last two columns.
-    num_class = int(dataset.data.iloc[:, num_columns-2].max()) + 1
-    num_state = int(dataset.data.iloc[:, num_columns-1].max()) + 1
-
-
-    subset_size = min(1000000, len(dataset))  # Ensure it doesn't exceed the dataset size
+    # Subset for memory efficiency
+    subset_size = min(1000000, len(full_dataset))
     subset_indices = list(range(subset_size))
-    dataset_subset = torch.utils.data.Subset(dataset, subset_indices)
+    dataset_subset = torch.utils.data.Subset(full_dataset, subset_indices)
 
     train_size = int(0.8 * len(dataset_subset))
     test_size = len(dataset_subset) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(dataset_subset, [train_size, test_size])
+
+    # Apply same scaler to test dataset
+    test_dataset = CustomCSVLoader(csv_path, scaler=scaler)
+
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    return train_loader, test_loader, num_features, num_class, num_state
+    return train_loader, test_loader, full_dataset.num_features, int(full_dataset.class_labels.max()) + 1, int(full_dataset.state_labels.max()) + 1
+
 
 # =============================================================================
 # Main: Start the Flower client
