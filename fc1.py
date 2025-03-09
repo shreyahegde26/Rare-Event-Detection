@@ -11,30 +11,43 @@ import torch.nn.functional as F
 # =============================================================================
 # Define the ANN model with dynamic input size and dynamic output sizes
 # =============================================================================
-class ANN(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DNN(nn.Module):
     def __init__(self, input_size, num_class, num_state):
-        super(ANN, self).__init__()
-        self.input_size = input_size  # dynamic input size
+        super(DNN, self).__init__()
+        self.input_size = input_size
 
-        # Shared layers (including input layer)
-        self.fc1 = nn.Linear(input_size, 128)  # fc1.weight: (128, input_size)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, 256)           # fc2.weight: (256, 128)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 128)           # fc3.weight: (128, 256)
-        self.dropout = nn.Dropout(0.3)
+        self.fc1 = nn.Linear(input_size, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        
+        self.fc2 = nn.Linear(256, 512)
+        self.bn2 = nn.BatchNorm1d(512)
+        
+        self.fc3 = nn.Linear(512, 256)
+        self.bn3 = nn.BatchNorm1d(256)
+        
+        self.fc4 = nn.Linear(256, 128)
+        self.bn4 = nn.BatchNorm1d(128)
 
-        # Output layers: using dynamic numbers for classification and state tasks
-        self.fc2_class = nn.Linear(128, num_class)  # classification head
-        self.fc2_state = nn.Linear(128, num_state)    # state head
+        self.dropout = nn.Dropout(p=0.3)  # Initialize dropout
+
+        self.fc2_class = nn.Linear(128, num_class)
+        self.fc2_state = nn.Linear(128, num_state)
 
     def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))  # shared input layer
-        x = F.relu(self.bn2(self.fc2(x)))  # shared hidden layer 1
+        x = F.leaky_relu(self.bn1(self.fc1(x)))
         x = self.dropout(x)
-        x = F.relu(self.fc3(x))            # shared hidden layer 2
-        class_out = self.fc2_class(x)
-        state_out = self.fc2_state(x)
+        x = F.leaky_relu(self.bn2(self.fc2(x)))
+        x = self.dropout(x)
+        x = F.leaky_relu(self.bn3(self.fc3(x)))
+        x = F.leaky_relu(self.bn4(self.fc4(x)))
+
+        class_out = F.log_softmax(self.fc2_class(x), dim=1)
+        state_out = F.log_softmax(self.fc2_state(x), dim=1)
+
         return class_out, state_out
 
 # =============================================================================
@@ -122,7 +135,7 @@ class FlowerClient(fl.client.NumPyClient):
 
     def save_model(self):
         """Save the trained model (whole model, not only weights)."""
-        model_path = f"flower_client_{self.cid}_model.pt"
+        model_path = f"/Users/saahil/Desktop/College/Sem 6/TDL_PROJ/FL/models/flower_client_{self.cid}_model.pt"
         torch.save(self.model, model_path)
         print(f"Whole model saved to {model_path}")
 
@@ -162,7 +175,7 @@ def load_data(csv_path):
     num_state = int(dataset.data.iloc[:, num_columns-1].max()) + 1
 
 
-    subset_size = min(10000, len(dataset))  # Ensure it doesn't exceed the dataset size
+    subset_size = min(1000000, len(dataset))  # Ensure it doesn't exceed the dataset size
     subset_indices = list(range(subset_size))
     dataset_subset = torch.utils.data.Subset(dataset, subset_indices)
 
@@ -185,7 +198,7 @@ if __name__ == "__main__":
 
     train_loader, test_loader, input_size, num_class, num_state = load_data(args.data_path)
     print(f"Using {num_class} classes and {num_state} states. Input size: {input_size}")
-    model = ANN(input_size=input_size, num_class=num_class, num_state=num_state)
+    model = DNN(input_size=input_size, num_class=num_class, num_state=num_state)
 
     fl.client.start_numpy_client(
         server_address="localhost:8080",
