@@ -3,22 +3,15 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split, Subset
 import pandas as pd
 import numpy as np
 import torch.nn.functional as F
-
-# =============================================================================
-# Define the ANN model with dynamic input size and dynamic output sizes
-# =============================================================================
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 
-import torch.nn as nn
-import torch.nn.functional as F
-
+# -------------------------------
+# 1. Define the ANN Model (DNN)
+# -------------------------------
 class DNN(nn.Module):
     def __init__(self, input_size, num_class, num_state):
         super(DNN, self).__init__()
@@ -36,7 +29,7 @@ class DNN(nn.Module):
         self.fc4 = nn.Linear(512, 256)
         self.bn4 = nn.LayerNorm(256)
 
-        self.dropout = nn.Dropout(p=0.3)  # Initialized
+        self.dropout = nn.Dropout(p=0.3)
 
         self.fc2_class = nn.Linear(256, num_class)
         self.fc2_state = nn.Linear(256, num_state)
@@ -50,15 +43,13 @@ class DNN(nn.Module):
         x = self.dropout(x)
         x = F.leaky_relu(self.bn4(self.fc4(x)))
 
-        class_out = self.fc2_class(x)  # No softmax here if using CrossEntropyLoss
+        class_out = self.fc2_class(x)  # Logits for class prediction
         state_out = self.fc2_state(x)
-
         return class_out, state_out
 
-
-# =============================================================================
-# Define the Flower client
-# =============================================================================
+# -------------------------------
+# 2. Flower Client Definition
+# -------------------------------
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, model, train_loader, test_loader, cid):
         self.model = model
@@ -68,14 +59,17 @@ class FlowerClient(fl.client.NumPyClient):
 
         self.criterion_class = nn.CrossEntropyLoss()
         self.criterion_state = nn.CrossEntropyLoss()
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        # Consider lowering the learning rate for stability
+        self.optimizer = optim.SGD(self.model.parameters(), lr=0.001, momentum=0.9)
+        
+        # Set device (CPU by default, or GPU if available)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
 
     def get_parameters(self, config=None):
-        """Return all model parameters as a list of NumPy arrays."""
         return [p.detach().cpu().numpy() for p in self.model.parameters()]
 
     def set_parameters(self, parameters):
-        """Set the model parameters from a list of NumPy arrays."""
         model_params = list(self.model.parameters())
         with torch.no_grad():
             for param, new_param in zip(model_params, parameters):
@@ -84,7 +78,7 @@ class FlowerClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         self.train(epochs=1)
-        self.save_model()  # Save the model after training
+        self.save_model()  # Save model after training (optional)
         return self.get_parameters(), len(self.train_loader.dataset), {}
 
     def evaluate(self, parameters, config):
@@ -94,11 +88,13 @@ class FlowerClient(fl.client.NumPyClient):
 
     def train(self, epochs):
         self.model.train()
-        for _ in range(epochs):
+        for epoch in range(epochs):
+            epoch_loss = 0.0
             for batch in self.train_loader:
-                features = batch["features"]
-                class_labels = batch["class"]
-                state_labels = batch["state"]
+                # Move data to device
+                features = batch["features"].to(self.device)
+                class_labels = batch["class"].to(self.device)
+                state_labels = batch["state"].to(self.device)
 
                 self.optimizer.zero_grad()
                 class_out, state_out = self.model(features)
@@ -106,8 +102,13 @@ class FlowerClient(fl.client.NumPyClient):
                 loss_state = self.criterion_state(state_out, state_labels)
                 loss = loss_class + loss_state
 
+                # Check if loss is NaN
+                if torch.isnan(loss):
+                    print("Warning: NaN loss encountered during training!")
                 loss.backward()
                 self.optimizer.step()
+                epoch_loss += loss.item()
+            print(f"Client {self.cid}: Epoch {epoch+1}, Loss: {epoch_loss/len(self.train_loader):.4f}")
 
     def test(self):
         self.model.eval()
@@ -118,14 +119,18 @@ class FlowerClient(fl.client.NumPyClient):
 
         with torch.no_grad():
             for batch in self.test_loader:
-                features = batch["features"]
-                class_labels = batch["class"]
-                state_labels = batch["state"]
+                # Move data to device
+                features = batch["features"].to(self.device)
+                class_labels = batch["class"].to(self.device)
+                state_labels = batch["state"].to(self.device)
 
                 class_out, state_out = self.model(features)
                 loss_class = self.criterion_class(class_out, class_labels)
                 loss_state = self.criterion_state(state_out, state_labels)
-                total_loss += loss_class.item() + loss_state.item()
+                batch_loss = loss_class.item() + loss_state.item()
+                if np.isnan(batch_loss):
+                    print("Warning: NaN loss encountered in test batch!")
+                total_loss += batch_loss
 
                 _, class_predicted = torch.max(class_out, 1)
                 _, state_predicted = torch.max(state_out, 1)
@@ -133,64 +138,58 @@ class FlowerClient(fl.client.NumPyClient):
                 total_state_correct += (state_predicted == state_labels).sum().item()
                 total_samples += class_labels.size(0)
 
+        if total_samples == 0:
+            print("Warning: No test samples found!")
+            return float('nan'), float('nan')
+
         class_accuracy = total_class_correct / total_samples
         state_accuracy = total_state_correct / total_samples
         overall_accuracy = (class_accuracy + state_accuracy) / 2
         avg_loss = total_loss / total_samples
+        print(f"Client {self.cid}: Test samples: {total_samples}, Class Acc: {class_accuracy:.4f}, State Acc: {state_accuracy:.4f}")
         return avg_loss, overall_accuracy
 
     def save_model(self):
-        """Save the trained model (whole model, not only weights)."""
         model_path = f"/Users/saahil/Desktop/College/Sem 6/TDL_PROJ/FL/models/flower_client_{self.cid}_model.pt"
         torch.save(self.model, model_path)
         print(f"Whole model saved to {model_path}")
 
-# =============================================================================
-# Custom Dataset Loader
-# =============================================================================
-import numpy as np
 
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-import torch
-from torch.utils.data import Dataset
-
+# -------------------------------
+# 3. Custom CSV Dataset Loader
+# -------------------------------
 class CustomCSVLoader(Dataset):
     def __init__(self, csv_file, scaler=None, fit_scaler=False):
         self.data = pd.read_csv(csv_file)
-        self.num_features = self.data.shape[1] - 2
+        self.num_features = self.data.shape[1] - 2  # Last two columns are labels
 
-        # Extract features before labels
+        # Extract features
         features = self.data.iloc[:, :self.num_features].values
 
-        # Debugging: Print max, min values
+        # Debug: Print max/min values
         print("Max value in dataset:", np.max(features))
         print("Min value in dataset:", np.min(features))
 
-        # **Step 1: Handle inf/nan values**
+        # Handle inf/nan values
         if np.isinf(features).any() or np.isnan(features).any():
-            print("Warning: Dataset contains inf/nan values. Replacing with mean.")
+            print("Warning: Dataset contains inf/nan values. Replacing with column means.")
             features = np.where(np.isfinite(features), features, np.nan)
             col_means = np.nanmean(features, axis=0)
             indices = np.where(np.isnan(features))
             features[indices] = np.take(col_means, indices[1])
+        
+        # Clip extreme values and convert to float32
+        features = np.clip(features, -1e6, 1e6).astype("float32")
 
-        # **Step 2: Clip extreme values to a reasonable range**
-        features = np.clip(features, -1e6, 1e6)  # Adjust threshold if needed
-
-        # **Step 3: Convert safely to float32**
-        features = features.astype("float32")
-
-        # **Step 4: Scale features**
+        # Scale features
         if fit_scaler:
             self.scaler = StandardScaler()
-            self.scaler.fit(features)  # Fit only on training data
+            self.scaler.fit(features)
         else:
-            self.scaler = scaler  # Use precomputed scaler
-
+            self.scaler = scaler
         self.features = self.scaler.transform(features)
 
+        # Load labels
         self.class_labels = self.data.iloc[:, self.num_features].values.astype(int)
         self.state_labels = self.data.iloc[:, self.num_features + 1].values.astype(int)
 
@@ -204,33 +203,32 @@ class CustomCSVLoader(Dataset):
             "state": torch.tensor(self.state_labels[idx], dtype=torch.long),
         }
 
-    
-
 def load_data(csv_path):
     full_dataset = CustomCSVLoader(csv_path, fit_scaler=True)
-    scaler = full_dataset.scaler  # Save scaler for test dataset
+    scaler = full_dataset.scaler  # Save scaler for later use
 
-    # Subset for memory efficiency
+    # Use a subset for memory efficiency, if desired.
     subset_size = min(1000000, len(full_dataset))
     subset_indices = list(range(subset_size))
-    dataset_subset = torch.utils.data.Subset(full_dataset, subset_indices)
+    dataset_subset = Subset(full_dataset, subset_indices)
 
+    # Split into training and test sets from the same subset
     train_size = int(0.8 * len(dataset_subset))
     test_size = len(dataset_subset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset_subset, [train_size, test_size])
-
-    # Apply same scaler to test dataset
-    test_dataset = CustomCSVLoader(csv_path, scaler=scaler)
-
+    train_dataset, test_dataset = random_split(dataset_subset, [train_size, test_size])
+    
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    return train_loader, test_loader, full_dataset.num_features, int(full_dataset.class_labels.max()) + 1, int(full_dataset.state_labels.max()) + 1
+    num_features = full_dataset.num_features
+    num_class = int(full_dataset.class_labels.max()) + 1
+    num_state = int(full_dataset.state_labels.max()) + 1
 
+    return train_loader, test_loader, num_features, num_class, num_state
 
-# =============================================================================
-# Main: Start the Flower client
-# =============================================================================
+# -------------------------------
+# 4. Main: Start the Flower Client
+# -------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Flower Client")
     parser.add_argument("--cid", type=int, required=True, help="Client ID (unique for each client)")
